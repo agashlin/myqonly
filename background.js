@@ -4,6 +4,7 @@ const PHABRICATOR_REVIEW_HEADERS = [
   "Must Review",
   "Ready to Review",
 ];
+const MULTI_ACCOUNT_CONTAINERS_EXTENSION_ID = "@testpilot-containers";
 const BUGZILLA_API = "https://bugzilla.mozilla.org/jsonrpc.cgi";
 const GITHUB_API = "https://api.github.com/search/issues";
 
@@ -137,6 +138,60 @@ const MyQOnly = {
     return data.total_count;
   },
 
+  async getCookieStoreForUrl(url) {
+    let assignment = await browser.runtime.sendMessage(
+      MULTI_ACCOUNT_CONTAINERS_EXTENSION_ID,
+      {
+        url,
+        method: "getAssignment",
+      },
+      {},
+    );
+
+    if (assignment && "userContextId" in assignment) {
+      return "firefox-container-" + String(assignment.userContextId);
+    } else {
+      return null;
+    }
+  },
+
+  async fetchWithCookies(req, cookies) {
+    req.credentials = "omit";
+
+    let cookieStr = cookies.map(pair => `${pair.name}=${pair.value}`).join("; ");
+    let originUrl = `${window.origin}/_generated_background_page.html`;
+
+    let headersRewriteListener = details => {
+      if (details.originUrl !== originUrl) {
+        return {};
+      }
+
+      // Remove any cookies.
+      let requestHeaders =
+        details.requestHeaders.filter(header =>
+          header.name.toLowerCase() !== "cookie");
+
+      requestHeaders.push({
+        name: "Cookie",
+        value: cookieStr,
+      });
+
+      return { requestHeaders };
+    };
+
+    browser.webRequest.onBeforeSendHeaders.addListener(headersRewriteListener,
+      {
+        urls: [req.url],
+        types: ["xmlhttprequest"],
+        tabId: browser.tabs.TAB_ID_NONE,
+      },
+      ["blocking", "requestHeaders"],
+    );
+    let resp = await window.fetch(req);
+    browser.webRequest.onBeforeSendHeaders.removeListener(headersRewriteListener);
+    return resp;
+  },
+
   /**
    * Contacts Phabricator, Bugzilla, and Github (if the API keys for them exist),
    * and attempts to get a review count for each.
@@ -150,8 +205,9 @@ const MyQOnly = {
       url: PHABRICATOR_ROOT,
       name: "phsid",
     });
+    let cookieStoreId = await this.getCookieStoreForUrl(PHABRICATOR_ROOT);
 
-    if (phabCookie) {
+    if (phabCookie || cookieStoreId) {
       console.log("Phabricator session found! Attempting to get dashboard page.");
       let url = [PHABRICATOR_ROOT, PHABRICATOR_DASHBOARD].join("/");
       let req = new Request(url, {
@@ -163,6 +219,22 @@ const MyQOnly = {
       });
 
       let resp = await window.fetch(req);
+
+      if (!resp.ok && cookieStoreId) {
+        // Try to use a login from a container.
+
+        phabCookie = await browser.cookies.get({
+          url: PHABRICATOR_ROOT,
+          name: "phsid",
+          storeId: cookieStoreId,
+        });
+
+        if (phabCookie) {
+          resp = await this.fetchWithCookies(req.clone(),
+            [ {name: "phsid", value: phabCookie.value} ]);
+        }
+      }
+
       let pageBody = await resp.text();
       let parser = new DOMParser();
       let doc = parser.parseFromString(pageBody, "text/html");
